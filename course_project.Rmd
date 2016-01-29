@@ -1,0 +1,200 @@
+---
+title: "Practical Machine Learning Project: Qualitative Activity Recognition"
+author: "Catherine White"
+date: "January 25, 2016"
+output: html_document
+---
+
+In this project, we analyze data from sensors placed on people performing bicep curls to try to identify whether the subject is performing the exercise correctly or if they are making one of four common mistakes.  We find that a random forest algorithm run on 25 principal components from the data set can identify the manner in which the bicep curl is being performed about 96% of the time in our validation set.  Prediction on entirely new data is expected to be less accurate.
+
+##The Data Set
+
+We will be be using the Weight Lifting Exercises data set, available [here](http://groupware.les.inf.puc-rio.br/har), to try to use features recorded by sensors to determine if a bicep curl is being performed correctly or with one of four common mistakes.  This data set consists of readings from sensors on a belt, an arm band on the upper arm, a glove, and the dumbbell.  Six different men were asked to perform ten repetitions of the exercise in each fashion: "exactly according to the specification (Class A), throwing the elbows to the front (Class B), lifting the dumbbell only halfway (Class C), lowering the dumbbell only halfway (Class D) and throwing the hips to the front (Class E)."[$^1$](http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf)
+
+
+### Getting the Data
+
+Before we can do anything, we need to download the files.  To avoid clutter, we first set the working directory to the temporary directory.
+
+```{r, warning=FALSE}
+#Load the libraries we'll need
+library(caret, warn.conflicts = FALSE, quietly = TRUE)
+library(dplyr, warn.conflicts = FALSE, quietly = TRUE)
+library(ggplot2, warn.conflicts = FALSE, quietly = TRUE)
+set.seed(100)
+
+#Move to the temporary directory and download the files if we don't have them
+setwd(tempdir())
+have_train_file <- file.exists("training.csv")
+have_test_file <- file.exists("testing.csv")
+
+if (!have_train_file) {
+    url<- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+    download.file(url, destfile = "training.csv")
+}
+if (!have_train_file) {
+    url<- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+    download.file(url, destfile = "testing.csv")
+}
+
+#Read in the data
+train <- read.csv("training.csv")
+test <- read.csv("testing.csv")
+```
+
+Now we have the files.  Let's look at some super basic information.
+
+```{r}
+#Dimensions of the training set
+dim(train)
+#Dimensions of the test set
+dim(test)
+#What are the names of the columns in train where the column names differ?
+names(train[names(test)!=names(train)])
+#What are the names of the columns in test where the column names differ?
+names(test[names(test)!=names(train)])
+```
+
+Basically, we have almost 20,000 observations of 160 different variables in the training set and 20 observations of mostly the same variables in the test set.  The one difference is that the training set contains the "classe" variable, which is the class of exercise being performed.  Class A is the correct performance of the exercise and the other classes are common mistakes.  The test set instead contains a problem ID that corresponds to the quiz in the Coursera course.  This means that the test set cannot be used to estimate the out of sample error because we don't know the right answers.
+
+### Exploratory Analysis
+
+Before we hand the data off to a machine learning algorithm, let's make sure that we actually want to be training on everything in the set.  Most notably, there are a good number of columns that are mostly empty.  These are from the analysis done by the group that put the data set together and are averages or variances over the a half-second window.  Since we want to recognize the class of exercise from a single time slice, we'll remove all the rows that have nothing except in the rows where `new_window` is "yes," the indicator that this row contains the window averages.
+
+Before we do anything, we'll convert the `new_window` column to a logical vector instead of a factor and set aside 30% of the training set as a validation set.
+
+```{r}
+#Change new_window to a logical vector rather than a factor.
+levels(train$new_window) <- c(FALSE, TRUE)
+train$new_window <- as.logical(train$new_window)
+levels(test$new_window) <- c(FALSE, TRUE)
+test$new_window <- as.logical(test$new_window)
+
+#Split the training set into a training set and a validation set.
+in_train <- createDataPartition(train$classe, p=.7, list=FALSE) 
+validation <- train[-in_train, ]
+train <- train[in_train, ]
+```
+
+Now let's figure out which columns we should ignore.  First, get how many non-NA values we have in each column.
+
+```{r}
+#Screen out the columns that only have values in the new_window rows
+col_value_counts <- apply(train, 2, FUN=function(x){sum(!is.na(x))})
+```
+
+Now let's check to see if any of the missing values are in the `new_window` rows.
+
+```{r}
+#How many NAs do we have in rows that have new_window==TRUE?
+missing_nw_rows <- apply(train, 2,
+                         FUN=function(x){sum(is.na(x[train$new_window]))})
+print(any(missing_nw_rows>0))
+```
+
+Since none of the missing values are in the `new_window==TRUE` rows, we can remove the window-averaged quantities by removing all the columns that have the same number of non-NA entries as `new_window` has TRUE values.  We'll also remove the the window information (`new_window` and `num_window`), the row number (`X`), and the time stamps because we're using single-time stamp information for our inferences.
+
+```{r}
+#Get the number of new_window rows and only keep the columns that have
+#a number of non-NA values not equal to that.  Also, don't keep the new_window
+#column because we don't need it anymore
+n_new_windows <- sum(train$new_window)
+keep_cols <- names(col_value_counts[col_value_counts!=n_new_windows])
+keep_cols <- keep_cols[keep_cols!="new_window"]
+keep_cols <- keep_cols[keep_cols!="num_window"]
+keep_cols <- keep_cols[keep_cols!="X"]
+keep_cols <- keep_cols[keep_cols!="raw_timestamp_part_1"]
+keep_cols <- keep_cols[keep_cols!="raw_timestamp_part_2"]
+keep_cols <- keep_cols[keep_cols!="cvtd_timestamp"]
+
+#Only keep the columns we care about
+train <- train[keep_cols]
+validation <- validation[keep_cols]
+keep_cols_test <- keep_cols
+keep_cols_test[keep_cols_test=="classe"] <- "problem_id"
+test <- test[keep_cols_test]
+```
+
+There are also several columns that are factor variables.  Let's see what they are.
+
+```{r}
+#Get all the classes for the variables left in train
+train_classes <- sapply(train, class)
+factor_cols <- train_classes=="factor"
+names(train_classes[factor_cols])
+```
+
+There are a bunch of them.  If you run `sapply(train[factor_cols], unique)`, you can see that many of these columns are mostly numbers but either include "" or "#DIV/0" in the list of levels.  (The output is very long, so I don't include it here.)  However, there are some columns that contain only two levels, "" and "#DIV/0".  These, when coerced into the numeric type, will only contain NAs.  We'll coerce all the factor columns except `classe` and `user_name` to be numeric and then remove columns with only NAs.
+
+```{r, warning=FALSE}
+#Coerce all the factor columns to numeric except classe and user_name.
+#We have to go through character first or it'll number the levels rather than
+#convert the strings to numbers
+coerce_cols <- names(factor_cols)[factor_cols]
+coerce_cols <- coerce_cols[!(coerce_cols %in% c("classe", "user_name"))]
+for (i in 1:length(coerce_cols)){
+    key <- coerce_cols[i]
+    train[key] <- as.numeric(as.character(train[key]))
+    validation[key] <- as.numeric(as.character(validation[key]))
+    test[key] <- as.numeric(as.character(test[key]))
+}
+
+#Which columns have only NAs?
+all_nas <- apply(train, 2, FUN=function(x){all(is.na(x))})
+#Select only the columns that aren't all NAs
+train <- train[!all_nas]
+validation <- validation[!all_nas]
+```
+
+Now we should be able to train the model.
+
+## Training the Model
+
+Let's start with Principal Component Analysis (PCA) on the training set to see if we can reduce the dimensionality of the data.  My laptop is essentially incapable of running a random forest on the entire data set and not hanging forever.
+
+```{r}
+#Do the principal component analysis with a 95% threshold
+preProc <- preProcess(train[, -length(names(train))], method="pca",thresh=.95)
+print(preProc)
+```
+
+The PCA decomposition only needs 25 values to capture 95% of the variance in the sample.  This is a little less than half of the features that we didn't throw out.  We'll run the random forest on the set of principal components instead of the entire data set.  
+
+```{r}
+#Run a random forest fit after cutting down to the 25 principal components
+pca_train <- predict(preProc, newdata = train)
+pca_rf_fit <- train(classe~., data=pca_train, method='rf')
+pca_rf_fit
+```
+
+The accuracy it quotes from the bootstrapped fit on the training data is ~96%.  Let's calculate the confusion matrix on the training set.
+
+```{r}
+#Look at the confusion matrices for the training set
+pca_rf_predictions <- predict(pca_rf_fit, newdata= pca_train)
+pca_rf_cm <- confusionMatrix(pca_rf_predictions, train$classe)
+pca_rf_cm$table
+```
+
+This is unbelievably accurate in the most literal sense of the word.  There is no confusion whatsoever.  It may actually be a sign of over-fitting.  In any case, a better representation of the out-of-sample error is the accuracy in the validation set.  Let's predict on the validation set and check the confusion matrix.
+
+```{r}
+#Predict for the validation set
+pca_validation_set <- predict(preProc, newdata = validation)
+pca_rf_validation <- predict(pca_rf_fit, newdata = pca_validation_set)
+validation_pca_cm <- confusionMatrix(pca_rf_validation,
+                                     pca_validation_set$classe)
+validation_pca_cm$table
+validation_pca_cm$overall["Accuracy"]
+```
+
+This is more believable but still very high accuracy.  The predictions for the official test set are below but do not help us estimate the errors because the `classe` variable is missing.
+
+```{r}
+pca_test <- predict(preProc, newdata = test)
+predict(pca_rf_fit, newdata = pca_test)
+```
+
+## Conclusions
+
+It seems that a random forest algorithm performed on the most important 25 principal components allows us to determine from one time step whether or not a bicep curl is being performed correctly with ~95% accuracy.  The accuracy was estimated from 25 bootstraps and bootstrapping is known to underestimate the error.  The accuracy on the validation set, which ought to be a somewhat better estimate of the out-of-sample error, is also high: 97%.  However, I would expect that entirely new samples would be less accurate, first because bootstrap estimates tend to be low, second because anything outside of a lab setting is messier than in a lab, and finally because we only have data from six males in the same age range.  New subjects may move in slightly different ways.
